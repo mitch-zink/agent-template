@@ -1,0 +1,30 @@
+{
+  "agents": {
+    "defaults": {
+      "model": { "primary": "anthropic/claude-opus-5-5", "fallbacks": ["openai/<model>", "openrouter/<model>"] },
+      "reasoning": { "root": "high", "subagent": "medium" },
+      "heartbeat": { "every": "30m", "quietHours": "23:00-08:00" },
+      "maxConcurrent": 2
+    },
+    "list": [
+      { "id": "main", "workspace": "." }
+    ]
+  },
+  "auth": {
+    "profiles": {
+      "anthropic:default": { "apiKeyEnv": "ANTHROPIC_API_KEY" },
+      "openai:default": { "apiKeyEnv": "OPENAI_API_KEY" }
+    }
+  },
+  "channels": {
+    "discord": { "enabled": false, "tokenEnv": "DISCORD_BOT_TOKEN", "allowFrom": ["<your-user-id>"], "groupPolicy": "mention-only" },
+    "slack": { "enabled": false, "tokenEnv": "SLACK_BOT_TOKEN", "allowFrom": ["<your-user-id>"] }
+  },
+  "tools": {
+    "exec": { "security": "allowlist", "ask": "on-destructive" },
+    "web": { "search": { "enabled": true } }
+  },
+  "connectors": "see .mcp.json at the repo root",
+  "memory": { "backend": "files", "citations": "on" },
+  "gateway": { "port": 18789, "bind": "127.0.0.1", "auth": { "mode": "token", "tokenEnv": "GATEWAY_TOKEN" } }
+}

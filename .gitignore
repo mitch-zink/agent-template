@@ -1,0 +1,12 @@
+config/agent.json
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite
+logs/
+tmp/
+.DS_Store
+node_modules/
+memory/heartbeat-state.json
+self_improvement/staging/

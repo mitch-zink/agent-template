@@ -1,0 +1,6 @@
+{
+  "anthropic/claude-sonnet-5.5": { "jobs": ["chat", "analysis", "routine"], "trainsOnData": false, "zdr": true },
+  "anthropic/claude-haiku-4.5":  { "jobs": ["chat", "routine"],             "trainsOnData": false, "zdr": true },
+  "openai/gpt-5-mini":           { "jobs": ["chat", "routine"],             "trainsOnData": false, "zdr": true },
+  "google/gemini-3.1-pro-preview":{ "jobs": ["chat", "analysis"],            "trainsOnData": false, "zdr": true }
+}
