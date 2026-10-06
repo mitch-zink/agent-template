@@ -21,7 +21,9 @@ export const defaultHost = (): Host => ({
   db: admin(),
 })
 
-// POST /api/agents/:id/turn   body: { messages: ModelMessage[] }
+// POST /api/agents/:id/turn   body: { text: string, conversationId?: string }
+// The client sends only its new words. History comes from the server: a client-supplied message list could carry a
+// forged tool call or a fake tool-approval-response and run a write nobody approved.
 export async function turn(req: Request, agentId: string, host = defaultHost()) {
   const user = await userFrom(req)
   if (!user) return new Response('sign in', { status: 401 })
@@ -33,14 +35,28 @@ export async function turn(req: Request, agentId: string, host = defaultHost()) 
   const { data: agent } = await asUser.from('agents').select('id, current_version_id, agent_versions!agents_current_version_fk(*)').eq('id', agentId).single()
   if (!agent) return new Response('not found', { status: 404 })
 
-  const { messages } = (await req.json()) as { messages: ModelMessage[] }
+  const { text, conversationId } = (await req.json()) as { text: string; conversationId?: string }
+  if (typeof text !== 'string' || !text.trim()) return new Response('text required', { status: 400 })
+
+  let history: ModelMessage[] = []
+  if (conversationId) {
+    const { data: last } = await host.db.from('agent_runs').select('messages, status')
+      .eq('conversation_id', conversationId).eq('user_id', user.id).eq('agent_id', agent.id)
+      .order('started_at', { ascending: false }).limit(1).single()
+    if (!last) return new Response('conversation not found', { status: 404 })
+    if (last.status === 'awaiting_approval') return new Response('decide the pending action first', { status: 409 })
+    history = last.messages as ModelMessage[]
+  }
+  const messages: ModelMessage[] = [...history, { role: 'user', content: text }]
+
   const { data: run } = await host.db.from('agent_runs')
-    .insert({ agent_id: agent.id, version_id: agent.current_version_id, user_id: user.id, trigger: 'chat' })
-    .select('id').single()
+    .insert({ agent_id: agent.id, version_id: agent.current_version_id, user_id: user.id, trigger: 'chat',
+              ...(conversationId ? { conversation_id: conversationId } : {}) })
+    .select('id, conversation_id').single()
   const memory = await loadMemory(host, agent.id, user.id)
 
   const result = await runTurn({ version: agent.agent_versions as never, user, runId: run!.id, messages, host, memory })
-  return result.toUIMessageStreamResponse()
+  return result.toUIMessageStreamResponse({ headers: { 'x-conversation-id': run!.conversation_id } })
 }
 
 // POST /api/agents/actions/:approvalId/decide   body: { approved: boolean }

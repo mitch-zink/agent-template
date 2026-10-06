@@ -62,7 +62,8 @@ create table public.agent_routines (
   cron         text not null,                       -- 5-field, in `timezone`
   timezone     text not null default 'America/New_York',
   prompt       text not null,
-  delivery     jsonb not null default '{}',         -- {channel: 'slack', target: '#team'} ; empty = Activity only
+  delivery     jsonb not null default '{}',         -- {channel_id} from the host's channel registry; empty = Activity only.
+                                                    -- Free-form targets are never posted to: posting is a write.
   enabled      boolean not null default false,
   expires_at   timestamptz,
   next_run_at  timestamptz,
@@ -81,7 +82,8 @@ create table public.agent_runs (
   period_start  timestamptz,
   status        text not null default 'running'
                 check (status in ('running', 'awaiting_approval', 'done', 'error', 'budget_stopped')),
-  messages      jsonb not null default '[]',        -- AI SDK model messages; what a resume replays
+  conversation_id uuid not null default gen_random_uuid(),
+  messages      jsonb not null default '[]',        -- AI SDK model messages, written by the server only; the client never supplies history
   model_used    text,
   tokens_in     int not null default 0,
   tokens_out    int not null default 0,
@@ -94,6 +96,7 @@ create table public.agent_runs (
 create unique index agent_runs_routine_period on public.agent_runs (routine_id, period_start)
   where routine_id is not null;
 create index agent_runs_recent on public.agent_runs (agent_id, started_at desc);
+create index agent_runs_conversation on public.agent_runs (conversation_id, started_at desc);
 
 create table public.agent_steps (
   run_id         uuid not null references public.agent_runs(id) on delete cascade,
@@ -176,7 +179,9 @@ begin
   if auth.role() = 'authenticated' and not agent_kit.is_admin() and (
        new.visibility is distinct from old.visibility and new.visibility <> 'private'
     or new.team     is distinct from old.team
-    or new.owner_id is distinct from old.owner_id) then
+    or new.owner_id is distinct from old.owner_id
+    -- Changing what a shared agent runs is a re-publish, so it needs the same review.
+    or (old.visibility <> 'private' and new.current_version_id is distinct from old.current_version_id)) then
     raise exception 'sharing an agent needs an admin';
   end if;
   return new;
@@ -212,8 +217,7 @@ create policy routines_owner on public.agent_routines for all to authenticated
 
 -- Runs, steps and actions are written by the server (service role) only.
 create policy runs_read on public.agent_runs for select to authenticated
-  using (user_id = auth.uid()
-      or exists (select 1 from public.agents a where a.id = agent_id and a.owner_id = auth.uid()));
+  using (user_id = auth.uid());   -- a shared agent's owner must not read viewers' conversations
 create policy steps_read on public.agent_steps for select to authenticated
   using (exists (select 1 from public.agent_runs r where r.id = run_id));   -- inherits runs_read
 create policy actions_read on public.agent_actions for select to authenticated

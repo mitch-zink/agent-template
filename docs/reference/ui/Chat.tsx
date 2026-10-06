@@ -1,14 +1,26 @@
 // Reference sketch of @agent-kit/react: chat with inline approval cards. @ai-sdk/react@4 (React 18 or 19).
 import { useChat } from '@ai-sdk/react'
 import { DefaultChatTransport } from 'ai'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 
 export function AgentChat({ agentId, accessToken }: { agentId: string; accessToken: string }) {
   const [input, setInput] = useState('')
+  const conversationId = useRef<string | undefined>(undefined)
   const { messages, sendMessage, status } = useChat({
     transport: new DefaultChatTransport({
       api: `/api/agents/${agentId}/turn`,
       headers: { Authorization: `Bearer ${accessToken}` },
+      // Send only the new text; the server owns the history (see the turn route).
+      prepareSendMessagesRequest: ({ messages }) => {
+        const last = messages[messages.length - 1]
+        const text = last?.parts.map(p => (p.type === 'text' ? p.text : '')).join('') ?? ''
+        return { body: { text, conversationId: conversationId.current } }
+      },
+      fetch: async (url, init) => {
+        const res = await fetch(url, init)
+        conversationId.current = res.headers.get('x-conversation-id') ?? conversationId.current
+        return res
+      },
     }),
   })
 
