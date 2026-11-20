@@ -212,7 +212,7 @@ sequenceDiagram
 
   CR->>T: net.http_post + secret from Vault
   T->>T: constant-time secret check
-  T->>DB: select due routines for update skip locked
+  T->>DB: claim due routines, one per owner, for update skip locked
   loop each due routine
     T->>DB: insert agent_runs (routine_id, period_start)
     Note over T,DB: unique index → a second tick for the same period is a no-op
@@ -335,6 +335,7 @@ Full DDL with RLS policies: [`schema.sql`](schema.sql).
 | Private data sent to a model that trains on it | `models.json` flags `trainsOnData`; such models are refused for any agent with tools. Test-enforced. |
 | Runaway spend | Per-run and per-day caps checked before every step; Gateway budgets as the outer fence. |
 | Double-fired schedules | Unique index on `(routine_id, period_start)`. |
+| One owner fills every scheduler slot | A tick claims at most one due routine per owner. Each owner can store 20 routines, and an authenticated write cannot set `next_run_at` in the past. |
 
 ---
 
