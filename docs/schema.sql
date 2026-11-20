@@ -21,7 +21,7 @@ $$;
 -- ---------------------------------------------------------------- agents
 create table public.agents (
   id                 uuid primary key default gen_random_uuid(),
-  owner_id           uuid references auth.users(id) on delete set null,  -- null = system / template agent
+  owner_id           uuid references auth.users(id) on delete restrict, -- null does not publish; a template sets visibility. Deleting a user must not clear this.
   team               text,
   slug               text not null,
   visibility         text not null default 'private' check (visibility in ('private', 'team', 'org')),
@@ -156,7 +156,11 @@ returns boolean language sql stable security definer set search_path = '' as $$
        a.owner_id = auth.uid()
     or (a.visibility = 'org')
     or (a.visibility = 'team' and agent_kit.can_see_team(a.team))
-    or (a.owner_id is null and agent_kit.can_see_team(a.team))
+    -- Ownerless is not public. A template is readable only when it is org-wide,
+    -- or team-scoped and the caller can see that team. Private stays private.
+    or (a.owner_id is null and (
+         a.visibility = 'org'
+      or (a.visibility = 'team' and agent_kit.can_see_team(a.team))))
     or agent_kit.is_admin())
 $$;
 
