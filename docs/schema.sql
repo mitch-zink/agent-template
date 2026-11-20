@@ -21,7 +21,7 @@ $$;
 -- ---------------------------------------------------------------- agents
 create table public.agents (
   id                 uuid primary key default gen_random_uuid(),
-  owner_id           uuid references auth.users(id) on delete set null,  -- null = system / template agent
+  owner_id           uuid references auth.users(id) on delete set null,  -- no owner (seeded template, or the user was deleted). Visibility still applies.
   team               text,
   slug               text not null,
   visibility         text not null default 'private' check (visibility in ('private', 'team', 'org')),
@@ -152,12 +152,20 @@ alter table public.agent_memory   enable row level security;
 
 create or replace function agent_kit.can_read_agent(a public.agents)
 returns boolean language sql stable security definer set search_path = '' as $$
-  select a.archived_at is null and (
+  -- coalesce: `owner_id = auth.uid()` is null when owner_id is null, and a null
+  -- result must not leak through a caller that forgets three-valued logic.
+  -- RLS already treats null as deny; the helper itself returns false.
+  select coalesce(a.archived_at is null and (
        a.owner_id = auth.uid()
     or (a.visibility = 'org')
     or (a.visibility = 'team' and agent_kit.can_see_team(a.team))
-    or (a.owner_id is null and agent_kit.can_see_team(a.team))
-    or agent_kit.is_admin())
+    -- Ownerless is not a bypass. A template is readable only at org, or at team
+    -- when the caller can see that team. Private stays private, including after
+    -- ON DELETE SET NULL and for seeds that leave the default visibility.
+    or (a.owner_id is null and (
+         a.visibility = 'org'
+      or (a.visibility = 'team' and agent_kit.can_see_team(a.team))))
+    or agent_kit.is_admin()), false)
 $$;
 
 -- Policies run as the caller, so the caller needs to reach the helpers (the schema itself stays unexposed to the Data API).
