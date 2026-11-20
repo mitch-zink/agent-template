@@ -334,9 +334,9 @@ Full DDL with RLS policies: [`schema.sql`](schema.sql).
 | User-made agent smuggles instructions | Tool output is data, never instructions. Builder only lists tools the creator holds. Sharing re-checks each viewer at run time. Publishing to a team needs an admin. |
 | Secrets leak to model or browser | Keys live in Vault and route env only. Key-shaped strings in user input are masked before the model or logs see them. Only the publishable Supabase key reaches the browser. |
 | Private data sent to a model that trains on it | `models.json` flags `trainsOnData`; such models are refused for any agent with tools. Test-enforced. |
-| Runaway spend | Per-run cap checked before every step; a routine fan-out is skipped once that agent's daily budget is spent. Gateway budgets are the outer fence. |
+| Runaway spend | Per-run cap checked before every step. A routine fan-out is skipped once that agent's daily spend, summed in SQL, reaches its daily budget. Gateway budgets are the outer fence. |
 | Double-fired schedules | Unique index on `(routine_id, period_start)`. |
-| One tenant fills the scheduler | Each tick claims at most one due routine per owner (25 total). Writes are capped at 8 routines per agent and 24 per owner, and `next_run_at` cannot be set in the past. |
+| One tenant fills the scheduler | Each tick claims at most one due routine per owner (25 total), and only for an agent that has a live version. Writes are capped at 8 routines per agent and 24 per owner, and `next_run_at` cannot be set in the past. A routine that cannot be parsed is disabled so it does not stay the oldest due row. |
 
 ---
 

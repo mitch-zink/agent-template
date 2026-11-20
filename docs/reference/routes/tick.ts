@@ -13,20 +13,26 @@ function authorized(req: Request) {
 
 type Db = ReturnType<typeof admin>
 
-// In-flight runs reserve a full per-run budget: cost_usd is written only when the run finishes,
-// so a count of finished cost alone would let a burst of routine runs start before any of them bill.
+// Spend is aggregated in SQL (agent_kit_agent_spend_today). Selecting the day's rows and summing
+// them here would stop at PostgREST's silent 1000-row cap and could fan out after the cap was hit.
 async function dailyBudgetClosed(db: Db, agentId: string, runBudget: number, dayBudget: number) {
   if (!Number.isFinite(runBudget) || !Number.isFinite(dayBudget) || runBudget <= 0 || dayBudget <= 0) return true
-  const now = new Date()
-  const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString()
-  const { data: rows, error } = await db.from('agent_runs').select('status, cost_usd').eq('agent_id', agentId).gte('started_at', dayStart)
+  const { data, error } = await db.rpc('agent_kit_agent_spend_today', { p_agent: agentId, p_run_budget: runBudget })
   if (error) throw new Error('budget read failed')
-  const used = (rows ?? []).reduce((sum, row) => {
-    if (row.status === 'running' || row.status === 'awaiting_approval') return sum + runBudget
-    const cost = Number(row.cost_usd ?? 0)
-    return sum + (Number.isFinite(cost) ? cost : runBudget)
-  }, 0)
-  return used >= dayBudget
+  const spent = Number(data)
+  if (!Number.isFinite(spent)) return true
+  return spent >= dayBudget
+}
+
+// A row we cannot fire must leave the due set. Left at its old next_run_at, it stays the oldest
+// bucket and a handful of such owners can hold every claim slot. disable is for a cron/timezone
+// that will throw again on every tick; retry is a backoff for a blip.
+async function releaseRoutine(db: Db, id: string, mode: 'retry' | 'disable') {
+  const hours = mode === 'disable' ? 24 : 1
+  await db.from('agent_routines').update({
+    next_run_at: new Date(Date.now() + hours * 60 * 60 * 1000).toISOString(),
+    ...(mode === 'disable' ? { enabled: false } : {}),
+  }).eq('id', id)
 }
 
 // POST /api/agents/tick
@@ -38,18 +44,36 @@ export async function tick(req: Request) {
 
   const fired: string[] = []
   for (const r of due ?? []) {
+    let scheduled = false
     try {
       const period = new Date(r.next_run_at)
       const { data: owner, error: ownerErr } = await db.from('agents').select('owner_id, current_version_id').eq('id', r.agent_id).single()
-      if (ownerErr || !owner?.current_version_id) continue
+      if (ownerErr || !owner) {
+        await releaseRoutine(db, r.id, 'retry')
+        continue
+      }
+      if (!owner.current_version_id) {
+        await releaseRoutine(db, r.id, 'retry')
+        continue
+      }
 
       const { data: version, error: verErr } = await db.from('agent_versions')
         .select('budget_run_usd, budget_day_usd').eq('id', owner.current_version_id).single()
-      if (verErr || !version) continue
+      if (verErr || !version) {
+        await releaseRoutine(db, r.id, 'retry')
+        continue
+      }
       const closed = await dailyBudgetClosed(db, r.agent_id, Number(version.budget_run_usd), Number(version.budget_day_usd))
 
-      const next = new Cron(r.cron, { timezone: r.timezone }).nextRun(new Date())
-      await db.from('agent_routines').update({ next_run_at: next?.toISOString() ?? null }).eq('id', r.id)
+      let nextIso: string | null
+      try {
+        nextIso = new Cron(r.cron, { timezone: r.timezone }).nextRun(new Date())?.toISOString() ?? null
+      } catch {
+        await releaseRoutine(db, r.id, 'disable')
+        continue
+      }
+      await db.from('agent_routines').update({ next_run_at: nextIso }).eq('id', r.id)
+      scheduled = true
 
       // The unique index on (routine_id, period_start) makes a duplicate tick a no-op.
       const { data: run, error } = await db.from('agent_runs').insert({
@@ -65,8 +89,11 @@ export async function tick(req: Request) {
       })
       fired.push(run.id)
     } catch {
-      // One bad cron, timezone, or read must not drop the other tenants in this batch.
-      continue
+      // One bad read must not drop the other tenants. If this row was not rescheduled, push it
+      // forward so it cannot sit at the front of the next claim.
+      if (!scheduled) {
+        try { await releaseRoutine(db, r.id, 'retry') } catch { /* failing closed is enough */ }
+      }
     }
   }
   return Response.json({ fired })

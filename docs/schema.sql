@@ -332,6 +332,8 @@ $$);
 -- At most one row per owner, and max_n is clamped to 25. A global ORDER BY next_run_at LIMIT 25
 -- let one owner with a backlog of due rows fill the whole window, so other tenants never ran.
 -- Null-owner (system) agents are a bucket of their own; signed-in users cannot create those.
+-- Agents with no live version are skipped: a routine there cannot run, and a frozen due row
+-- would otherwise stay the oldest bucket and hold a claim slot forever.
 create or replace function public.agent_kit_claim_due_routines(max_n int default 25)
 returns setof public.agent_routines language plpgsql volatile security invoker set search_path = '' as $$
 declare
@@ -346,6 +348,7 @@ begin
       from public.agent_routines r
       join public.agents a on a.id = r.agent_id
       where r.enabled
+        and a.current_version_id is not null
         and r.next_run_at <= pg_catalog.now()
         and (r.expires_at is null or r.expires_at > pg_catalog.now())
       group by coalesce(a.owner_id, r.agent_id)
@@ -358,6 +361,7 @@ begin
     join public.agents a on a.id = r.agent_id
     where coalesce(a.owner_id, r.agent_id) = bkt
       and r.enabled
+      and a.current_version_id is not null
       and r.next_run_at <= pg_catalog.now()
       and (r.expires_at is null or r.expires_at > pg_catalog.now())
     order by r.next_run_at, r.id
@@ -371,3 +375,22 @@ begin
 end $$;
 revoke all on function public.agent_kit_claim_due_routines(int) from public, anon, authenticated;
 grant execute on function public.agent_kit_claim_due_routines(int) to service_role;
+
+-- Today's spend for one agent, computed in the database. A PostgREST row select is capped
+-- (default 1000, HTTP 200), so summing those rows in /tick would miss spend once a minutely
+-- routine had inserted enough budget_stopped or chat rows. In-flight runs reserve a full
+-- per-run budget because cost_usd stays 0 until the run finishes.
+create or replace function public.agent_kit_agent_spend_today(p_agent uuid, p_run_budget numeric)
+returns numeric language sql stable security invoker set search_path = '' as $$
+  select coalesce(sum(
+    case
+      when r.status in ('running', 'awaiting_approval') then greatest(coalesce(p_run_budget, 0), 0)
+      else r.cost_usd
+    end
+  ), 0)
+  from public.agent_runs r
+  where r.agent_id = p_agent
+    and r.started_at >= (date_trunc('day', pg_catalog.now() at time zone 'utc') at time zone 'utc')
+$$;
+revoke all on function public.agent_kit_agent_spend_today(uuid, numeric) from public, anon, authenticated;
+grant execute on function public.agent_kit_agent_spend_today(uuid, numeric) to service_role;
