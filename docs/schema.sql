@@ -337,6 +337,10 @@ $$);
 -- The row locked for a bucket is that bucket's single oldest id. LIMIT 1 FOR UPDATE SKIP LOCKED
 -- over the whole bucket would let a second tick take the same owner's next routine. If that one
 -- row is already locked, the bucket is skipped and the next owner fills the slot.
+-- The due predicates are repeated on the locked read. Postgres rechecks only that WHERE after
+-- waiting for the row, and an id match alone would still return a routine that was disabled,
+-- archived, or advanced before the lock. Owners are ordered on this cursor, not on an inner
+-- query: a subquery ORDER BY is not the iteration order, so the overdue buckets could be skipped.
 create or replace function public.agent_kit_claim_due_routines(max_n int default 25)
 returns setof public.agent_routines language plpgsql volatile security invoker set search_path = '' as $$
 declare
@@ -357,24 +361,30 @@ begin
         and r.next_run_at <= pg_catalog.now()
         and (r.expires_at is null or r.expires_at > pg_catalog.now())
       group by coalesce(a.owner_id, r.agent_id)
-      order by oldest, bkt
     ) grp
+    order by grp.oldest, grp.bkt
   loop
     select r.* into rec
     from public.agent_routines r
+    join public.agents a on a.id = r.agent_id
     where r.id = (
       select r2.id
       from public.agent_routines r2
-      join public.agents a on a.id = r2.agent_id
-      where coalesce(a.owner_id, r2.agent_id) = bkt
+      join public.agents a2 on a2.id = r2.agent_id
+      where coalesce(a2.owner_id, r2.agent_id) = bkt
         and r2.enabled
-        and a.archived_at is null
-        and a.current_version_id is not null
+        and a2.archived_at is null
+        and a2.current_version_id is not null
         and r2.next_run_at <= pg_catalog.now()
         and (r2.expires_at is null or r2.expires_at > pg_catalog.now())
       order by r2.next_run_at, r2.id
       limit 1
     )
+      and r.enabled
+      and a.archived_at is null
+      and a.current_version_id is not null
+      and r.next_run_at <= pg_catalog.now()
+      and (r.expires_at is null or r.expires_at > pg_catalog.now())
     for update of r skip locked;
     if found then
       return next rec;
