@@ -324,6 +324,7 @@ Full DDL with RLS policies: [`schema.sql`](schema.sql).
 | User-made agent points a tool at its own server | Versions store a server **id**; only servers in the host's registry are ever dialed. A URL in agent data is never used, so no token goes to an arbitrary host and nothing internal is reachable. |
 | Agent borrows another agent's private version | Composite foreign key: an agent's current version must belong to that agent. |
 | Owner shares an agent past review | Widening visibility, changing team or owner, and skipping approval on a write tool are admin-only (enforced by triggers, not the UI). |
+| Private ownerless agent is world-readable | `can_read_agent` gives a null owner no extra access: `org` is org-wide, `team` requires `can_see_team`, and `private` stays private. `owner_id` is `on delete restrict`, so deleting a user cannot turn their agent into an ownerless row. |
 | Client forges history to skip approval | The client sends only new text and a conversation id. History, tool calls and approval responses come from the server's own run records. |
 | Shared agent's owner reads viewers' chats | Runs are visible only to the user who ran them. |
 | Owner edits a shared agent after review | Changing the live version of a non-private agent is a re-publish and needs an admin. |
