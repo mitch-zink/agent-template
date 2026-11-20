@@ -336,7 +336,7 @@ Full DDL with RLS policies: [`schema.sql`](schema.sql).
 | Private data sent to a model that trains on it | `models.json` flags `trainsOnData`; such models are refused for any agent with tools. Test-enforced. |
 | Runaway spend | Per-run cap checked before every step. A routine fan-out is skipped once that agent's daily spend, summed in SQL, reaches its daily budget. Gateway budgets are the outer fence. |
 | Double-fired schedules | Unique index on `(routine_id, period_start)`. |
-| One tenant fills the scheduler | Each tick claims at most one due routine per owner (25 total), and only for an agent that has a live version. Writes are capped at 8 routines per agent and 24 per owner, and `next_run_at` cannot be set in the past. A routine that cannot be parsed is disabled so it does not stay the oldest due row. |
+| One tenant fills the scheduler | Each tick claims at most one due routine per owner (25 total), and only for an agent that is not archived and has a live version. A concurrent tick skips an owner whose row is already locked instead of taking that owner's next routine. Writes are capped at 8 routines per agent and 24 per owner, and `next_run_at` cannot be set in the past. A routine that cannot be parsed is disabled so it does not stay the oldest due row. |
 
 ---
 
