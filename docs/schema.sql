@@ -161,7 +161,8 @@ returns boolean language sql stable security definer set search_path = '' as $$
 $$;
 
 -- Policies run as the caller, so the caller needs to reach the helpers (the schema itself stays unexposed to the Data API).
-grant usage on schema agent_kit to authenticated;
+-- service_role runs /tick, which updates next_run_at and therefore fires the routine triggers.
+grant usage on schema agent_kit to authenticated, service_role;
 grant execute on function agent_kit.can_see_team(text), agent_kit.is_admin(), agent_kit.can_read_agent(public.agents) to authenticated;
 
 create policy agents_read on public.agents for select to authenticated
@@ -215,6 +216,90 @@ create policy routines_owner on public.agent_routines for all to authenticated
   using (exists (select 1 from public.agents a where a.id = agent_id and a.owner_id = auth.uid()))
   with check (exists (select 1 from public.agents a where a.id = agent_id and a.owner_id = auth.uid()));
 
+-- RLS lets an owner write any cron and any next_run_at. A past next_run_at sorts ahead of every
+-- other tenant in the due index, so clamp it to now. now() is not immutable, so this cannot be a CHECK.
+create or replace function agent_kit.clamp_routine_next_run()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  if new.next_run_at is not null and new.next_run_at < pg_catalog.now() then
+    new.next_run_at := pg_catalog.now();
+  end if;
+  return new;
+end $$;
+create trigger routines_clamp_next_run before insert or update of next_run_at on public.agent_routines
+  for each row execute function agent_kit.clamp_routine_next_run();
+
+-- 8 per agent and 24 per owner. Enough for a few agents with real schedules; not an unbounded
+-- backlog of always-due rows. System agents (null owner) are capped per agent only. A signed-in
+-- user cannot create those (agents_insert requires owner_id = auth.uid()).
+-- Not callable directly: a caller could pass someone else's agent id and hold its quota lock.
+create or replace function agent_kit.enforce_routine_quota(touched uuid[])
+returns void language plpgsql security definer set search_path = '' as $$
+declare
+  touched_agent uuid;
+  touched_owner uuid;
+  n int;
+begin
+  -- Lock then count, in id order, so two concurrent inserts cannot both pass a stale count.
+  for touched_agent in select distinct u from unnest(touched) as u order by 1 loop
+    perform pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended('agent_kit.routine_agent:' || touched_agent::text, 0));
+  end loop;
+  for touched_agent in select distinct u from unnest(touched) as u order by 1 loop
+    select count(*) into n from public.agent_routines r where r.agent_id = touched_agent;
+    if n > 8 then
+      raise exception 'routine quota exceeded';
+    end if;
+  end loop;
+
+  for touched_owner in
+    select distinct a.owner_id
+    from public.agents a
+    where a.id = any(touched) and a.owner_id is not null
+    order by 1
+  loop
+    perform pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended('agent_kit.routine_owner:' || touched_owner::text, 0));
+    select count(*) into n
+    from public.agent_routines r
+    join public.agents a on a.id = r.agent_id
+    where a.owner_id = touched_owner;
+    if n > 24 then
+      raise exception 'routine quota exceeded';
+    end if;
+  end loop;
+end $$;
+revoke all on function agent_kit.enforce_routine_quota(uuid[]) from public;
+grant execute on function agent_kit.enforce_routine_quota(uuid[]) to current_user;
+
+create or replace function agent_kit.guard_routine_quota()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  perform agent_kit.enforce_routine_quota(array(select distinct nr.agent_id from new_rows nr));
+  return null;
+end $$;
+create trigger routines_quota after insert on public.agent_routines
+  referencing new table as new_rows
+  for each statement execute function agent_kit.guard_routine_quota();
+
+-- UPDATE OF is incompatible with transition tables, so this fires on every update and
+-- returns immediately unless a routine moved to another agent (a quota bypass).
+create or replace function agent_kit.guard_routine_move()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  if exists (
+    select 1 from new_rows n
+    join old_rows o on o.id = n.id
+    where n.agent_id is distinct from o.agent_id
+  ) then
+    perform agent_kit.enforce_routine_quota(array(select distinct nr.agent_id from new_rows nr));
+  end if;
+  return null;
+end $$;
+create trigger routines_quota_move after update on public.agent_routines
+  referencing old table as old_rows new table as new_rows
+  for each statement execute function agent_kit.guard_routine_move();
+
 -- Runs, steps and actions are written by the server (service role) only.
 create policy runs_read on public.agent_runs for select to authenticated
   using (user_id = auth.uid());   -- a shared agent's owner must not read viewers' conversations
@@ -243,14 +328,46 @@ select cron.schedule('agent-kit-tick', '* * * * *', $$
     body    := '{}'::jsonb)
 $$);
 
--- Claim due routines atomically. Called by /tick with the service role only (invoker rights; RLS bypassed by that role).
+-- Claim due routines for /tick. Service role only (security invoker; that role bypasses RLS).
+-- At most one row per owner, and max_n is clamped to 25. A global ORDER BY next_run_at LIMIT 25
+-- let one owner with a backlog of due rows fill the whole window, so other tenants never ran.
+-- Null-owner (system) agents are a bucket of their own; signed-in users cannot create those.
 create or replace function public.agent_kit_claim_due_routines(max_n int default 25)
-returns setof public.agent_routines language sql security invoker set search_path = '' as $$
-  select r.* from public.agent_routines r
-  where r.enabled and r.next_run_at <= now() and (r.expires_at is null or r.expires_at > now())
-  order by r.next_run_at
-  limit max_n
-  for update skip locked
-$$;
+returns setof public.agent_routines language plpgsql volatile security invoker set search_path = '' as $$
+declare
+  n int := least(greatest(coalesce(max_n, 25), 1), 25);
+  bkt uuid;
+  rec public.agent_routines;
+begin
+  for bkt in
+    select grp.bkt
+    from (
+      select coalesce(a.owner_id, r.agent_id) as bkt, min(r.next_run_at) as oldest
+      from public.agent_routines r
+      join public.agents a on a.id = r.agent_id
+      where r.enabled
+        and r.next_run_at <= pg_catalog.now()
+        and (r.expires_at is null or r.expires_at > pg_catalog.now())
+      group by coalesce(a.owner_id, r.agent_id)
+      order by oldest, bkt
+      limit n
+    ) grp
+  loop
+    select r.* into rec
+    from public.agent_routines r
+    join public.agents a on a.id = r.agent_id
+    where coalesce(a.owner_id, r.agent_id) = bkt
+      and r.enabled
+      and r.next_run_at <= pg_catalog.now()
+      and (r.expires_at is null or r.expires_at > pg_catalog.now())
+    order by r.next_run_at, r.id
+    limit 1
+    for update of r skip locked;
+    if found then
+      return next rec;
+    end if;
+  end loop;
+  return;
+end $$;
 revoke all on function public.agent_kit_claim_due_routines(int) from public, anon, authenticated;
 grant execute on function public.agent_kit_claim_due_routines(int) to service_role;

@@ -212,12 +212,13 @@ sequenceDiagram
 
   CR->>T: net.http_post + secret from Vault
   T->>T: constant-time secret check
-  T->>DB: select due routines for update skip locked
+  T->>DB: claim due routines, one per owner, for update skip locked
   loop each due routine
+    T->>T: per-row try/catch
+    T->>DB: advance next_run_at
     T->>DB: insert agent_runs (routine_id, period_start)
     Note over T,DB: unique index → a second tick for the same period is a no-op
-    T->>RR: fetch (fan out, one invocation per run)
-    T->>DB: advance next_run_at
+    T->>RR: fetch only while that agent's daily budget remains
   end
   RR->>C: runTurn as agent owner, tools re-checked now
   C-->>CH: post the result
@@ -333,8 +334,9 @@ Full DDL with RLS policies: [`schema.sql`](schema.sql).
 | User-made agent smuggles instructions | Tool output is data, never instructions. Builder only lists tools the creator holds. Sharing re-checks each viewer at run time. Publishing to a team needs an admin. |
 | Secrets leak to model or browser | Keys live in Vault and route env only. Key-shaped strings in user input are masked before the model or logs see them. Only the publishable Supabase key reaches the browser. |
 | Private data sent to a model that trains on it | `models.json` flags `trainsOnData`; such models are refused for any agent with tools. Test-enforced. |
-| Runaway spend | Per-run and per-day caps checked before every step; Gateway budgets as the outer fence. |
+| Runaway spend | Per-run cap checked before every step; a routine fan-out is skipped once that agent's daily budget is spent. Gateway budgets are the outer fence. |
 | Double-fired schedules | Unique index on `(routine_id, period_start)`. |
+| One tenant fills the scheduler | Each tick claims at most one due routine per owner (25 total). Writes are capped at 8 routines per agent and 24 per owner, and `next_run_at` cannot be set in the past. |
 
 ---
 
