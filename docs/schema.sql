@@ -215,6 +215,59 @@ create policy routines_owner on public.agent_routines for all to authenticated
   using (exists (select 1 from public.agents a where a.id = agent_id and a.owner_id = auth.uid()))
   with check (exists (select 1 from public.agents a where a.id = agent_id and a.owner_id = auth.uid()));
 
+-- An owner can store a bounded number of routines. An authenticated insert cannot place
+-- next_run_at in the past. An update that leaves the column alone keeps an overdue time,
+-- so editing a waiting routine does not drop its age. An update also cannot move a future
+-- schedule backward: a stale full-row save of the previous time would make the routine due
+-- again under a new period_start after the tick had already advanced it.
+-- The tick runs as the service role and is exempt: it has to advance next_run_at.
+create or replace function agent_kit.guard_routine_write()
+returns trigger language plpgsql security definer set search_path = '' as $$
+declare
+  owner uuid;
+  n int;
+  routine_cap constant int := 20;
+begin
+  if auth.role() is distinct from 'authenticated' then
+    return new;
+  end if;
+  if tg_op = 'INSERT' then
+    if new.next_run_at is not null and new.next_run_at < now() then
+      new.next_run_at := now();
+    end if;
+  elsif new.next_run_at is distinct from old.next_run_at
+        and new.next_run_at is not null
+        and new.next_run_at < now()
+        and (old.next_run_at is null or new.next_run_at < old.next_run_at) then
+    if old.next_run_at is null or old.next_run_at < now() then
+      new.next_run_at := now();
+    else
+      new.next_run_at := old.next_run_at;
+    end if;
+  end if;
+  if tg_op <> 'INSERT' then
+    return new;
+  end if;
+
+  select a.owner_id into owner from public.agents a where a.id = new.agent_id;
+  -- Not this caller's agent: leave the row for RLS to reject. Don't lock the other owner.
+  if owner is null or owner is distinct from auth.uid() then
+    return new;
+  end if;
+
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(owner::text, 0));
+  select count(*) into n
+  from public.agent_routines r
+  join public.agents a on a.id = r.agent_id
+  where a.owner_id = owner;
+  if n >= routine_cap then
+    raise exception 'routine limit reached';
+  end if;
+  return new;
+end $$;
+create trigger routines_guard_write before insert or update on public.agent_routines
+  for each row execute function agent_kit.guard_routine_write();
+
 -- Runs, steps and actions are written by the server (service role) only.
 create policy runs_read on public.agent_runs for select to authenticated
   using (user_id = auth.uid());   -- a shared agent's owner must not read viewers' conversations
@@ -243,14 +296,37 @@ select cron.schedule('agent-kit-tick', '* * * * *', $$
     body    := '{}'::jsonb)
 $$);
 
--- Claim due routines atomically. Called by /tick with the service role only (invoker rights; RLS bypassed by that role).
+-- Claim due routines atomically, at most one per owner. Called by /tick with the service role
+-- only (invoker rights; RLS bypassed by that role). A global ORDER BY next_run_at LIMIT would
+-- let one owner with many always-due rows fill every slot; other tenants would never be claimed.
+-- System agents (null owner) are bucketed per agent. A signed-in user cannot create those.
 create or replace function public.agent_kit_claim_due_routines(max_n int default 25)
 returns setof public.agent_routines language sql security invoker set search_path = '' as $$
-  select r.* from public.agent_routines r
-  where r.enabled and r.next_run_at <= now() and (r.expires_at is null or r.expires_at > now())
-  order by r.next_run_at
-  limit max_n
-  for update skip locked
+  with ranked as materialized (
+    select r2.id, r2.next_run_at,
+           row_number() over (
+             partition by coalesce(a.owner_id, r2.agent_id)
+             order by r2.next_run_at, r2.id
+           ) as owner_rank
+    from public.agent_routines r2
+    join public.agents a on a.id = r2.agent_id
+    where r2.enabled
+      and r2.next_run_at <= now()
+      and (r2.expires_at is null or r2.expires_at > now())
+  )
+  select r.*
+  from public.agent_routines r
+  where r.id in (
+    select ranked.id from ranked
+    where ranked.owner_rank = 1
+    order by ranked.next_run_at, ranked.id
+    limit max_n
+  )
+  and r.enabled
+  and r.next_run_at <= now()
+  and (r.expires_at is null or r.expires_at > now())
+  order by r.next_run_at, r.id
+  for update of r skip locked
 $$;
 revoke all on function public.agent_kit_claim_due_routines(int) from public, anon, authenticated;
 grant execute on function public.agent_kit_claim_due_routines(int) to service_role;
