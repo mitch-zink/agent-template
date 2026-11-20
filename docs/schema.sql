@@ -215,8 +215,11 @@ create policy routines_owner on public.agent_routines for all to authenticated
   using (exists (select 1 from public.agents a where a.id = agent_id and a.owner_id = auth.uid()))
   with check (exists (select 1 from public.agents a where a.id = agent_id and a.owner_id = auth.uid()));
 
--- An owner can store a bounded number of routines, and cannot place next_run_at in the past.
--- A past timestamp would sort ahead of every other tenant under the claim's age order.
+-- An owner can store a bounded number of routines. An authenticated insert cannot place
+-- next_run_at in the past. An update that leaves the column alone keeps an overdue time,
+-- so editing a waiting routine does not drop its age. An update also cannot move a future
+-- schedule backward: a stale full-row save of the previous time would make the routine due
+-- again under a new period_start after the tick had already advanced it.
 -- The tick runs as the service role and is exempt: it has to advance next_run_at.
 create or replace function agent_kit.guard_routine_write()
 returns trigger language plpgsql security definer set search_path = '' as $$
@@ -228,8 +231,19 @@ begin
   if auth.role() is distinct from 'authenticated' then
     return new;
   end if;
-  if new.next_run_at is not null and new.next_run_at < now() then
-    new.next_run_at := now();
+  if tg_op = 'INSERT' then
+    if new.next_run_at is not null and new.next_run_at < now() then
+      new.next_run_at := now();
+    end if;
+  elsif new.next_run_at is distinct from old.next_run_at
+        and new.next_run_at is not null
+        and new.next_run_at < now()
+        and (old.next_run_at is null or new.next_run_at < old.next_run_at) then
+    if old.next_run_at is null or old.next_run_at < now() then
+      new.next_run_at := now();
+    else
+      new.next_run_at := old.next_run_at;
+    end if;
   end if;
   if tg_op <> 'INSERT' then
     return new;

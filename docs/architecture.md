@@ -335,7 +335,7 @@ Full DDL with RLS policies: [`schema.sql`](schema.sql).
 | Private data sent to a model that trains on it | `models.json` flags `trainsOnData`; such models are refused for any agent with tools. Test-enforced. |
 | Runaway spend | Per-run and per-day caps checked before every step; Gateway budgets as the outer fence. |
 | Double-fired schedules | Unique index on `(routine_id, period_start)`. |
-| One owner fills every scheduler slot | A tick claims at most one due routine per owner. Each owner can store 20 routines, and an authenticated write cannot set `next_run_at` in the past. |
+| One owner fills every scheduler slot | A tick claims at most one due routine per owner. Each owner can store 20 routines. An authenticated insert cannot set `next_run_at` in the past, and an update cannot move it earlier. |
 
 ---
 
