@@ -15,6 +15,7 @@ function authorized(req: Request) {
 export async function tick(req: Request) {
   if (!authorized(req)) return new Response('no', { status: 401 })
   const db = admin()
+  // At most one due routine per owner (agent_kit_claim_due_routines). The batch cannot be one tenant's.
   const { data: due } = await db.rpc('agent_kit_claim_due_routines', { max_n: 25 })
 
   const fired: string[] = []
